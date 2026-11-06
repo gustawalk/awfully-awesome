@@ -2,7 +2,12 @@
   import { Button } from "$lib/components/ui/button";
   import type { Message } from "$lib/transport/transport.svelte";
   import type { HostApi } from "$lib/plugins/api";
-  import { commonGames, isComplete, type RouletteState } from "./logic";
+  import {
+    commonGames,
+    isComplete,
+    sampleSpinPool,
+    type RouletteState,
+  } from "./logic";
   import { chunkAppids, fetchIsMultiplayer, fetchOwnedGames, resolveSteamId } from "./steam-api";
 
   interface Props {
@@ -58,24 +63,29 @@
   // old 350ms (~170/min) guaranteed 429s from our own relay after ten apps.
   $effect(() => {
     const ids = common;
-    if (mpStopped || ids.length === 0 || state.spun || mpBusy) return;
+    if (mpStopped || !multiplayerOnly || ids.length === 0 || state.spun || mpBusy)
+      return;
     const missing = ids.filter((id) => !(String(id) in mpFlags));
     if (missing.length === 0) return;
     mpBusy = true;
     void (async () => {
-      const next = { ...mpFlags };
       for (const id of missing) {
+        let flag: boolean;
         try {
-          next[String(id)] = await fetchIsMultiplayer(id);
+          flag = await fetchIsMultiplayer(id);
         } catch {
           mpStopped = true; // unconfigured host or rate limited: park it
           break;
         }
+        // Persist EVERY flag as it lands. The whole backlog takes minutes
+        // at this pace, and saving only at the end meant any reload or
+        // room switch threw the progress away - every visit refetched the
+        // same games from scratch, forever.
+        mpFlags = { ...mpFlags, [String(id)]: flag };
+        void host.storage.set(MP_KEY, mpFlags);
         mpChecked += 1;
         await new Promise((r) => setTimeout(r, 7000));
       }
-      mpFlags = next;
-      void host.storage.set(MP_KEY, next);
       mpBusy = false;
     })();
   });
@@ -175,13 +185,27 @@
     }
   }
 
+  let spinError = $state<string | null>(null);
   async function spin() {
     if (spinningSend || state.spun || common.length === 0) return;
     spinningSend = true;
+    spinError = null;
     try {
-      await host.sendUpdate(card.id, { action: "spin", pool });
+      // Only a real multiplayer subset rides the wire: the reducer's
+      // no-pool fallback IS the full common set, and a big shared library
+      // serialized into the update blows the host's 4KB cap. A too-big
+      // subset is thinned with sampleSpinPool - every client folds the
+      // pool that was SENT, so a sender-side sample stays deterministic.
+      const filtered = multiplayerOnly && mpPool.length > 0;
+      await host.sendUpdate(
+        card.id,
+        filtered
+          ? { action: "spin", pool: sampleSpinPool(pool) }
+          : { action: "spin" }
+      );
     } catch (err) {
       console.error("[steam-roulette] spin failed:", err);
+      spinError = "Spin failed to send - try again.";
     } finally {
       spinningSend = false;
     }
@@ -205,7 +229,8 @@
   }
 </script>
 
-<div class="flex max-w-sm flex-col gap-3 font-mono">
+<!-- w-full: the host frame sets the default card size. -->
+<div class="flex w-full flex-col gap-3 font-mono">
   <div class="text-sm font-semibold">Steam roulette</div>
 
   {#if !state.spun}
@@ -268,6 +293,9 @@
       <Button size="sm" onclick={spin} disabled={spinningSend}>
         {spinningSend ? "Spinning..." : `Spin (${pool.length} in the pot)`}
       </Button>
+      {#if spinError}
+        <p class="text-xs text-destructive">{spinError}</p>
+      {/if}
     {:else if linkedMembers.filter((m) => m.done).length >= 2}
       <div class="text-xs text-destructive">No games in common. Tragic.</div>
     {/if}
@@ -288,7 +316,7 @@
         href={`https://store.steampowered.com/app/${state.winnerAppid}`}
         target="_blank"
         rel="noopener noreferrer"
-        class="block overflow-hidden rounded-md border border-border hover:border-primary/60 transition-colors"
+        class="block max-w-sm overflow-hidden rounded-md border border-border hover:border-primary/60 transition-colors"
       >
         <img
           src={`https://cdn.cloudflare.steamstatic.com/steam/apps/${state.winnerAppid}/header.jpg`}
